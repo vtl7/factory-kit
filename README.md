@@ -1,6 +1,8 @@
-# fabrik-kit
+# Factory-Kit
 
 Skills, Hooks und Skripte, die den Auftragsablauf der Software-Fabrik in Claude Code abbilden: Auftrag, Bauen in Scheiben, Prüfung über Kreuz, Abnahme, Risikostufen T0 bis T3.
+
+Die Doku ist deutsch und spricht vom „Fabrik-Kit“. Der Befehl heißt `fabrik`, Projektdateien liegen unter `.fabrik/` und `.claude/fabrik/`.
 
 - Konzept: [KONZEPT.md](KONZEPT.md)
 - Arbeitsregeln: [AGENTS.md](AGENTS.md)
@@ -14,19 +16,19 @@ Voraussetzungen: `python3` ab 3.9, `git`, [`gh`](https://cli.github.com/) und Cl
 Kit einmal holen, am besten auf einem festen Versions-Tag:
 
 ```bash
-git clone --branch v0.4.0 <URL dieses Repos> ~/fabrik-kit
+git clone --branch v0.4.0 https://github.com/vtl7/factory-kit.git ~/factory-kit
 ```
 
 Einmal je Rechner (prüft `gh`, legt den Partner an):
 
 ```bash
-~/fabrik-kit/bin/fabrik setup --partner codex
+~/factory-kit/bin/fabrik setup --partner codex
 ```
 
 Im Projektordner:
 
 ```bash
-~/fabrik-kit/bin/fabrik init
+~/factory-kit/bin/fabrik init
 ```
 
 `init` erkennt Prüf- und Testbefehl, Ship und Verify, legt `.fabrik/fabrik.yml` an (eine vorhandene bleibt), kopiert Skills nach `.claude/skills/` und Skripte nach `.claude/fabrik/`, trägt den Stufen-Hook in `.claude/settings.json` ein (vorhandene Einträge bleiben), ergänzt `AGENTS.md`, legt `.github/workflows/fabrik.yml` und die Labels an und erlaubt GitHub Actions, Revert-PRs zu öffnen. Danach die Änderungen über einen PR einreichen.
@@ -58,7 +60,7 @@ Hat der Partner mitgebaut, prüft ein frischer Claude-Subagent. Ab 90 % im 5-Stu
 Das Kit folgt [Semantic Versioning](https://semver.org/lang/de/). Die Nummer steht in `kit/VERSION`, die Änderungen je Version in [CHANGELOG.md](CHANGELOG.md). `fabrik init` schreibt die Kit-Version samt Commit nach `.claude/fabrik/VERSION` und in den Kopf von `.fabrik/fabrik.yml`. So ist in jedem Projekt nachvollziehbar, welcher Stand eingebunden ist:
 
 ```bash
-~/fabrik-kit/bin/fabrik version
+~/factory-kit/bin/fabrik version
 ```
 
 Im Projektordner zeigt der Befehl zusätzlich die eingebundene Version und meldet eine Abweichung. Wie eine neue Version entsteht, steht in [RELEASING.md](RELEASING.md).
