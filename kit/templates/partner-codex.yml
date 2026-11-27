@@ -1,0 +1,11 @@
+# Fabrik-Kit: Partner je Rechner. Angelegt von 'fabrik setup'. Der Prompt kommt auf stdin.
+name: codex
+modelle:
+  standard: gpt-6.2-sol
+  tief: gpt-6.2-astra
+aufwand:
+  standard: low
+  tief: medium
+bauen: codex exec -m {modell} -c model_reasoning_effort={aufwand} --sandbox workspace-write -
+pruefen: codex exec -m {modell} -c model_reasoning_effort={aufwand} --sandbox read-only -
+kontingent: "python3 .claude/fabrik/usage.py codex-kontingent"

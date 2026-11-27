@@ -1,0 +1,15 @@
+name: tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # 3.9 gibt es auf ubuntu-latest nicht mehr; lokal läuft das System-python3 3.9.
+          python-version: "3.12"
+      - run: python3 -m unittest discover -s tests -v

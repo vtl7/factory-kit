@@ -1,0 +1,98 @@
+# Fabrik-Kit: Gate und Risikostufe je PR, Merge-Prüfung nach jedem Push auf den Hauptzweig.
+# Angelegt von 'fabrik init'. Änderungen hier sind Stufe T2.
+name: fabrik
+
+on:
+  pull_request:
+  push:
+    branches: [__MAIN__]
+
+permissions: {}
+
+jobs:
+  fabrik-gate:
+    if: github.event_name == 'pull_request'
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Gate-Skripte aus dem Basis-Commit
+        run: |
+          # Ein PR darf sein eigenes Gate nicht ersetzen: Skripte kommen aus dem Basis-Commit.
+          # Nur bei der ersten Einbindung (Basis ohne Kit) laufen die Skripte des PR.
+          if git cat-file -e "$BASE_SHA:.claude/fabrik/gate.py" 2>/dev/null; then
+            mkdir -p "$RUNNER_TEMP/fabrik"
+            git archive "$BASE_SHA" .claude/fabrik | tar -x -C "$RUNNER_TEMP/fabrik"
+            echo "FABRIK_BIN=$RUNNER_TEMP/fabrik/.claude/fabrik" >> "$GITHUB_ENV"
+          else
+            echo "FABRIK_BIN=$GITHUB_WORKSPACE/.claude/fabrik" >> "$GITHUB_ENV"
+          fi
+      - name: Gate
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          flag=""
+          if printf '%s' "$PR_BODY" | grep -qiE 'Verhaltens(ä|ae)nderung:[[:space:]]*\**[[:space:]]*ja'; then flag="--behavior-change"; fi
+          python3 "$FABRIK_BIN/gate.py" --base "$BASE_SHA" --setup $flag
+
+  fabrik-risk-label:
+    needs: fabrik-gate
+    if: always() && github.event_name == 'pull_request'
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Risikostufe als Label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          risk_script=$(git ls-tree --name-only "$BASE_SHA" -- .claude/fabrik/risk.py)
+          if [ -z "$risk_script" ]; then
+            echo "Kein Risiko-Skript im Basis-Commit. Das Label entfällt."
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/fabrik"
+          git archive "$BASE_SHA" .claude/fabrik | tar -x -C "$RUNNER_TEMP/fabrik"
+          python3 -I "$RUNNER_TEMP/fabrik/.claude/fabrik/risk.py" --base "$BASE_SHA" --label "$PR_NUMBER"
+
+  fabrik-merge-audit:
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Merge ohne Prüfurteil melden
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        # Läuft nach dem Merge, also mit den Skripten, die jetzt auf dem Hauptzweig liegen.
+        run: python3 .claude/fabrik/merge_audit.py --sha "$AFTER" --before "$BEFORE"

@@ -1,0 +1,38 @@
+# Fabrik-Kit: Adapter dieses Projekts. Angelegt von 'fabrik init' (Kit __VERSION__).
+# Änderungen hier sind Stufe T2. Gate und Hook lesen die Fassung auf dem Hauptzweig.
+
+# Prüfbefehl für das Gate. Muss mit Exitcode 0 enden.
+check: __CHECK__
+# Einrichtung vor dem Gate in der CI (Abhängigkeiten installieren). Leer lassen, wenn nicht nötig.
+setup: __SETUP__
+# Testbefehl für die Rot-Grün-Probe. {files} wird durch die neuen Testdateien ersetzt.
+test_cmd: __TEST_CMD__
+# Exitcodes, die "Test schlägt fehl" bedeuten (pytest: 1 und 2).
+test_fail_codes: [1, 2]
+test_paths:
+__TEST_PATHS__
+# Pfade, die eine Änderung nicht anfassen darf (Gate wird rot). Neue Dateien sind erlaubt.
+protected_paths: []
+# Auslieferung und Prüfung danach. Leer lassen, wenn es sie nicht gibt.
+ship: __SHIP__
+verify: __VERIFY__
+main_branch: __MAIN__
+# Zusätzliche Trailer für Agenten-Commits, etwa wenn die AGENTS.md des Projekts sie verlangt.
+# Form 'Schlüssel: Wert'. Gebaut-von setzt das Kit selbst.
+commit_trailers: []
+timeout_s: 1800
+
+# Eigene Pfade für die Risikokategorien des Kits (Kategorien ergänzen, nie streichen).
+# Kategorien: doku, migration, abhaengigkeit, ci_deploy, kit, auth_secrets, zahlung, rechte, daten_loeschen
+risk: {}
+#   auth_secrets:
+#     - src/login/
+#   daten_loeschen:
+#     - src/cleanup/
+# Neue Kategorien mit Stufe:
+extra_categories: {}
+#   export: T2
+
+# Repos dieses Produkts. Das erste ist das Dach-Repo für Sammel-Issues.
+repos:
+  - __REPO__

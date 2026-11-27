@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""fabrik: binds the kit into a project (init) and checks this machine (setup).
+
+  fabrik init  [--no-github] [--yes]     im Projektordner ausführen
+  fabrik setup [--partner codex|keiner]  einmal je Rechner
+  fabrik version                         Kit-Version, im Projekt auch die eingebundene
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import sys
+from pathlib import Path
+
+KIT = Path(__file__).resolve().parent.parent / "kit"
+sys.path.insert(0, str(KIT / "fabrik"))
+import fabrik_lib as lib  # noqa: E402
+
+SKILLS = ("auftrag", "bauen", "pruefen", "abnahme")
+HOOK_COMMAND = 'python3 "$CLAUDE_PROJECT_DIR"/.claude/fabrik/stage_hook.py'
+LABELS = (
+    ("Idee", "c5def5", "Gedanke, noch kein Auftrag"),
+    ("Konzept", "bfd4f2", "Auftrag in Klärung"),
+    ("Stapel", "fef2c0", "bestätigt, wartet auf Bau"),
+    ("In Arbeit", "fbca04", "Bau-Sitzung läuft"),
+    ("Wartet auf dich", "d93f0b", "braucht eine Entscheidung des Product Owners"),
+    ("nachts", "5319e7", "darf in der Nachtschicht gebaut werden"),
+    ("T0", "0e8a16", "Risikostufe: Doku, Tests"),
+    ("T1", "c2e0c6", "Risikostufe: Feature oder Bugfix"),
+    ("T2", "f9d0c4", "Risikostufe: Migration, Abhängigkeit, CI, Kit"),
+    ("T3", "b60205", "Risikostufe: Auth, Secrets, Zahlung, Rechte"),
+    ("Vorfall", "e11d21", "unerwartetes Verhalten"),
+    ("Festgefahren", "000000", "drei Prüfrunden verbraucht"),
+    (lib.LABEL_URGENT, "b60205", "darf am Partnerlimit auf Claude ausweichen"),
+    (lib.LABEL_CLAUDE_ONLY, "ededed", "ohne zweiten Hersteller geprüft"),
+)
+
+
+def say(text):
+    print(text, flush=True)
+
+
+def sh(args, cwd=None):
+    try:
+        return lib.run(args, cwd=cwd)
+    except FileNotFoundError:
+        return 127, "", f"{args[0]} nicht gefunden"
+
+
+def kit_version():
+    version = (KIT / "VERSION").read_text().strip()
+    code, out, _ = sh(["git", "rev-parse", "--short", "HEAD"], cwd=KIT)
+    return f"{version} ({out.strip()})" if code == 0 else version
+
+
+# --- Detection ----------------------------------------------------------------------
+
+def detect(root, ask):
+    found = {"check": "", "setup": "", "test_cmd": "", "ship": "", "verify": ""}
+    has = lambda name: (root / name).exists()  # noqa: E731
+    python = has("pyproject.toml") or has("setup.py") or any(root.glob("requirements*.txt")) \
+        or any(root.glob("test*/test_*.py")) or any(root.glob("test*/*_test.py"))
+    if has("uv.lock"):
+        found.update(check="uv run pytest -q", test_cmd="uv run pytest -q {files}",
+                     setup="pip install uv && uv sync")
+    elif python:
+        setup = "python3 -m pip install pytest"
+        if has("requirements.txt"):
+            setup = "python3 -m pip install -r requirements.txt pytest"
+        elif has("pyproject.toml"):
+            setup = "python3 -m pip install -e . pytest"
+        found.update(check="python3 -m pytest -q", test_cmd="python3 -m pytest -q {files}",
+                     setup=setup)
+    elif has("package.json"):
+        scripts = json.loads((root / "package.json").read_text() or "{}").get("scripts", {})
+        if "test" in scripts:
+            found.update(check="npm test", test_cmd="npm test -- {files}", setup="npm ci")
+    elif has("Cargo.toml"):
+        found.update(check="cargo test")
+    elif has("go.mod"):
+        found.update(check="go test ./...")
+    for key, names in (("ship", ("ship.sh", "scripts/ship.sh", "bin/ship")),
+                       ("verify", ("verify.sh", "scripts/verify.sh", "bin/verify"))):
+        for name in names:
+            if (root / name).is_file():
+                found[key] = f"./{name}"
+                break
+    if not found["check"]:
+        found["check"] = ask("Prüfbefehl für das Gate (z. B. 'make test')", "")
+    tests = [f"{d}/" for d in ("tests", "test", "__tests__", "spec") if (root / d).is_dir()]
+    found["test_paths"] = tests or ["tests/"]
+    code, out, _ = sh(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=root)
+    found["main"] = out.strip().split("/", 1)[-1] if code == 0 and out.strip() else "main"
+    code, out, _ = sh(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+                      cwd=root)
+    found["repo"] = out.strip() if code == 0 and out.strip() else root.name
+    return found
+
+
+def render_config(found):
+    text = (KIT / "templates" / "fabrik.yml").read_text(encoding="utf-8")
+    quote = lambda v: json.dumps(v, ensure_ascii=False) if v else '""'  # noqa: E731
+    replacements = {
+        "__VERSION__": kit_version(), "__CHECK__": quote(found["check"]),
+        "__SETUP__": quote(found["setup"]), "__TEST_CMD__": quote(found["test_cmd"]),
+        "__TEST_PATHS__": "\n".join(f"  - {p}" for p in found["test_paths"]),
+        "__SHIP__": quote(found["ship"]), "__VERIFY__": quote(found["verify"]),
+        "__MAIN__": found["main"], "__REPO__": found["repo"],
+    }
+    for key, value in replacements.items():
+        text = text.replace(key, value)
+    lib.load_config(".", text)  # must parse with the kit's own reader
+    return text
+
+
+# --- Files --------------------------------------------------------------------------
+
+def write(path, text, report, note="angelegt"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old = path.read_text(encoding="utf-8") if path.exists() else None
+    if old == text:
+        report.append(f"  unverändert  {path}")
+        return
+    path.write_text(text, encoding="utf-8")
+    report.append(f"  {note if old is None else 'erneuert'}  {path}")
+
+
+def install_files(root, report):
+    for script in sorted((KIT / "fabrik").glob("*.py")):
+        write(root / ".claude/fabrik" / script.name, script.read_text(encoding="utf-8"), report)
+    limits = KIT / "fabrik" / "known_limits.md"
+    write(root / ".claude/fabrik" / limits.name, limits.read_text(encoding="utf-8"), report)
+    write(root / ".claude/fabrik/VERSION", kit_version() + "\n", report)
+    for name in SKILLS:
+        source = KIT / "skills" / name / "SKILL.md"
+        write(root / ".claude/skills" / name / "SKILL.md", source.read_text(encoding="utf-8"), report)
+
+
+def merge_settings(root, report):
+    path = root / ".claude" / "settings.json"
+    data = json.loads(path.read_text(encoding="utf-8") or "{}") if path.exists() else {}
+    entries = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    for entry in entries:
+        for hook in entry.get("hooks", []):
+            if "stage_hook.py" in hook.get("command", ""):
+                hook["command"] = HOOK_COMMAND
+                break
+        else:
+            continue
+        break
+    else:
+        entries.append({"matcher": "Bash", "hooks": [{"type": "command", "command": HOOK_COMMAND}]})
+    write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", report)
+
+
+def merge_agents(root, report):
+    block = (KIT / "templates" / "agents-block.md").read_text(encoding="utf-8")
+    arch = (KIT / "templates" / "agents-architektur.md").read_text(encoding="utf-8")
+    path = root / "AGENTS.md"
+    text = path.read_text(encoding="utf-8") if path.exists() else "# AGENTS.md\n"
+    pattern = re.compile(r"<!-- fabrik:start -->.*?<!-- fabrik:end -->\n?", re.S)
+    text = pattern.sub(lambda _: block, text) if pattern.search(text) \
+        else text.rstrip() + "\n\n" + block
+    if "## Architekturregeln" not in text:
+        text = text.rstrip() + "\n\n" + arch
+    write(path, text, report)
+    claude = root / "CLAUDE.md"
+    current = claude.read_text(encoding="utf-8") if claude.exists() else ""
+    if "AGENTS.md" not in current:
+        write(claude, (current.rstrip() + "\n\n" if current.strip() else "") + "@AGENTS.md\n", report)
+
+
+def install_workflow(root, main_branch, report):
+    text = (KIT / "templates" / "fabrik-ci.yml").read_text(encoding="utf-8")
+    write(root / ".github/workflows/fabrik.yml", text.replace("__MAIN__", main_branch), report)
+
+
+# --- GitHub -------------------------------------------------------------------------
+
+def setup_github(root, report):
+    for name, color, description in LABELS:
+        code, _, err = sh(["gh", "label", "create", name, "--color", color, "--description",
+                           description, "--force"], cwd=root)
+        report.append(f"  Label {name}: {'ok' if code == 0 else 'FEHLER ' + err.strip()}")
+    endpoint = "repos/{owner}/{repo}/actions/permissions/workflow"
+    code, out, err = sh(["gh", "api", endpoint], cwd=root)
+    if code != 0:
+        report.append(f"  Actions-Rechte nicht lesbar: {err.strip()}")
+        return
+    current = json.loads(out or "{}")
+    if current.get("can_approve_pull_request_reviews"):
+        report.append("  Actions dürfen PRs anlegen: schon an")
+        return
+    code, _, err = sh(["gh", "api", "-X", "PUT", endpoint, "-f",
+                       f"default_workflow_permissions={current.get('default_workflow_permissions', 'read')}",
+                       "-F", "can_approve_pull_request_reviews=true"], cwd=root)
+    report.append("  Actions dürfen PRs anlegen (für Revert-PRs): "
+                  + ("eingeschaltet" if code == 0 else "FEHLER " + err.strip()))
+
+
+# --- Commands -----------------------------------------------------------------------
+
+def make_ask(assume_yes):
+    def ask(question, default):
+        if assume_yes or not sys.stdin.isatty():
+            return default
+        answer = input(f"{question} [{default}]: ").strip()
+        return answer or default
+    return ask
+
+
+def cmd_init(args):
+    code, out, _ = sh(["git", "rev-parse", "--show-toplevel"], cwd=os.getcwd())
+    if code != 0:
+        say("fabrik init: kein Git-Repo. Im Projektordner ausführen.")
+        return 2
+    root = Path(out.strip())
+    report = [f"fabrik init in {root} (Kit {kit_version()})"]
+    config_path = root / lib.CONFIG_PATH
+    if config_path.exists():
+        config = lib.load_config(root)
+        main_branch = config["main_branch"]
+        report.append(f"  behalten     {config_path}")
+    else:
+        found = detect(root, make_ask(args.yes))
+        write(config_path, render_config(found), report)
+        main_branch = found["main"]
+        config = lib.load_config(root)
+    install_files(root, report)
+    merge_settings(root, report)
+    merge_agents(root, report)
+    install_workflow(root, main_branch, report)
+    if not args.no_github:
+        setup_github(root, report)
+    say("\n".join(report))
+    if not config.get("check"):
+        say("\nAchtung: 'check' fehlt in .fabrik/fabrik.yml. Ohne Prüfbefehl bleibt das Gate rot.")
+    say("\nNächster Schritt: Änderungen auf einem Branch committen und als PR einreichen. "
+        "Mit dem Merge dieses PR ist das Kit eingebunden.")
+    return 0
+
+
+def cmd_setup(args):
+    ok = True
+    lines = ["fabrik setup"]
+    code, out, _ = sh(["gh", "--version"])
+    lines.append(f"  gh: {out.splitlines()[0] if code == 0 else 'FEHLT – https://cli.github.com'}")
+    ok &= code == 0
+    if code == 0:
+        code, out, err = sh(["gh", "auth", "status"])
+        text = out + err
+        scopes = set(re.findall(r"'([a-z:_]+)'", text.split("Token scopes:")[-1])) \
+            if "Token scopes:" in text else set()
+        missing = {"repo", "workflow"} - scopes
+        if code != 0:
+            lines.append("  gh angemeldet: NEIN – 'gh auth login' ausführen")
+            ok = False
+        elif missing and scopes:
+            lines.append(f"  gh Rechte: es fehlen {', '.join(sorted(missing))} – "
+                         f"'gh auth refresh -s {','.join(sorted(missing))}'")
+            ok = False
+        else:
+            lines.append("  gh angemeldet: ja (Issues, PRs, Merge, Workflows)")
+    lines.append(f"  python3: {sys.version.split()[0]}"
+                 + ("" if sys.version_info >= (3, 9) else " – zu alt, mindestens 3.9"))
+    ok &= sys.version_info >= (3, 9)
+    target = lib.partner_file()
+    choice = args.partner
+    if not target.exists() and choice is None and sys.stdin.isatty():
+        default = "codex" if shutil.which("codex") else "keiner"
+        choice = input(f"Partner für die Prüfung über Kreuz (codex/keiner) [{default}]: ").strip() \
+            or default
+    if choice == "codex" and not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(KIT / "templates" / "partner-codex.yml", target)
+        lines.append(f"  Partner angelegt: {target}")
+    if target.exists():
+        partner = lib.load_yaml(target.read_text(encoding="utf-8"))
+        missing = [k for k in ("bauen", "pruefen", "kontingent") if not partner.get(k)]
+        binary = str(partner.get("pruefen", "")).split()[0] if partner.get("pruefen") else ""
+        found = bool(binary and shutil.which(binary))
+        lines.append(f"  Partner: {partner.get('name')} ({target})"
+                     + (f" – es fehlen {', '.join(missing)}" if missing else "")
+                     + ("" if found else f" – Befehl '{binary}' nicht gefunden"))
+        ok &= found and not missing
+        if "modelle" not in partner:
+            template = lib.load_yaml((KIT / "templates" / "partner-codex.yml").read_text(encoding="utf-8"))
+            lines.append(f"  Hinweis für {target}: Empfohlene Modellstufen für einen Codex-Partner")
+            for key in ("modelle", "aufwand"):
+                lines.append(f"  {key}:")
+                lines.extend(f"    {stage}: {value}" for stage, value in template[key].items())
+            lines.append("  In bauen und pruefen dazu -m {modell} -c model_reasoning_effort={aufwand} ergänzen.")
+    else:
+        lines.append("  Partner: keiner – es prüft ein frischer Claude-Subagent "
+                     "('fabrik setup --partner codex' richtet Codex ein)")
+    code, out, _ = sh(["git", "rev-parse", "--show-toplevel"])
+    project = Path(out.strip()).resolve() if code == 0 else KIT.parent.resolve()
+    script = project / ".claude/fabrik/usage.py"
+    if not script.is_file():
+        script = (KIT / "fabrik/usage.py").resolve()
+    command = f"cd {shlex.quote(str(project))} && python3 {shlex.quote(str(script))}"
+    lines.append("  Crontab-Hinweis für das Nutzungsprotokoll:")
+    lines.append("  */30 * * * * " + command.replace("%", r"\%") + " snapshot")
+    say("\n".join(lines))
+    return 0 if ok else 1
+
+
+def cmd_version(args):
+    say(f"Fabrik-Kit {kit_version()}")
+    code, out, _ = sh(["git", "rev-parse", "--show-toplevel"])
+    installed = Path(out.strip()) / ".claude/fabrik/VERSION" if code == 0 else None
+    if installed is None or not installed.is_file():
+        return 0
+    project = installed.read_text(encoding="utf-8").strip()
+    say(f"Im Projekt eingebunden: {project}")
+    if project.split()[0] != (KIT / "VERSION").read_text().strip():
+        say("Abweichende Version. 'fabrik init' übernimmt den Stand dieses Kits.")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="fabrik", description="Fabrik-Kit einbinden und prüfen")
+    parser.add_argument("--version", action="version", version=f"Fabrik-Kit {kit_version()}")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("init", help="Kit in das Projekt im aktuellen Ordner einbinden")
+    p.add_argument("--no-github", action="store_true", help="keine Labels, keine Repo-Einstellung")
+    p.add_argument("--yes", action="store_true", help="nichts fragen, Erkanntes übernehmen")
+    p = sub.add_parser("setup", help="Rechner prüfen: gh und Partner")
+    p.add_argument("--partner", choices=("codex", "keiner"))
+    sub.add_parser("version", help="Version des Kits und des eingebundenen Stands zeigen")
+    args = parser.parse_args(argv)
+    commands = {"init": cmd_init, "setup": cmd_setup, "version": cmd_version}
+    try:
+        return commands[args.cmd](args)
+    except lib.FabrikError as exc:
+        say(f"fabrik {args.cmd}: {exc}")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
